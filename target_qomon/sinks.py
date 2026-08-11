@@ -14,10 +14,6 @@ class ContactsSink(QomonSink):
 
     name = "Contacts"
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._pending_tags: list[str] = []
-
     @staticmethod
     def _normalize_subscription_status(status: str | None) -> str:
         if not status:
@@ -35,66 +31,69 @@ class ContactsSink(QomonSink):
         elif status == "subscribed" and record.get("subscribe_status") is not None:
             payload["black_list"] = False
 
-    def _build_tags(self) -> list[dict[str, str]]:
-        """Map pending tag names to Qomon tag objects."""
-        tags: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for tag_name in self._pending_tags:
-            lowered = tag_name.lower()
-            if lowered in seen:
-                continue
-            tags.append({"name": tag_name})
-            seen.add(lowered)
-        return tags
-
-    def preprocess_record(self, record: dict[str, Any], context: dict) -> dict:
-        """Map, lookup, and merge a unified record before writing to Qomon."""
-        self._pending_tags = [
-            str(tag).strip()
-            for tag in (record.get("tags") or [])
+    @staticmethod
+    def _build_tags(tags: list[Any]) -> list[dict[str, str]]:
+        """Map unified tag strings to Qomon tag objects."""
+        return [
+            {"name": str(tag).strip()}
+            for tag in tags
             if tag is not None and str(tag).strip()
         ]
 
+    def preprocess_record(self, record: dict[str, Any], context: dict) -> dict:
+        """Map, lookup, and merge a unified record before writing to Qomon."""
         payload, _custom_field_names = build_contact_payload(record)
         matching_contact = self.find_matching_contact(record)
         only_upsert_empty_fields = bool(self.config.get("only_upsert_empty_fields"))
 
-        if matching_contact:
-            if only_upsert_empty_fields:
-                payload = self.merge_empty_fields(matching_contact, payload)
-            matching_id = matching_contact.get("id")
-            if matching_id is not None:
-                payload["_qomon_id"] = matching_id
+        if matching_contact and only_upsert_empty_fields:
+            payload = self.merge_empty_fields(matching_contact, payload)
 
         self._apply_subscribe_status(payload, record)
 
-        tags = self._build_tags()
-        if tags:
-            payload["tags"] = tags
+        if record.get("tags"):
+            payload["tags"] = self._build_tags(record["tags"])
 
-        return self.clean_null_values(payload)
+        payload = self.clean_null_values(payload)
+        payload = self.prepare_sync_contact(payload, matching_contact)
+
+        matching_id = matching_contact.get("id") if matching_contact else None
+        if matching_id is not None:
+            payload["_qomon_id"] = matching_id
+
+        return payload
 
     def upsert_record(self, record: dict, context: dict):
-        """Create or update a contact via the Qomon upsert endpoint."""
+        """Create or update a contact via synchronous Qomon write endpoints."""
         state_dict: dict[str, Any] = {}
         contact_id = record.pop("_qomon_id", None)
-        if contact_id is not None:
-            record["id"] = contact_id
+        is_update = contact_id is not None
+        envelope = self.build_contact_envelope(record)
 
-        envelope = self.build_upsert_envelope(record)
-        response = self.request_api(
-            "POST",
-            endpoint="contacts/upsert",
-            request_data=envelope,
-        )
-        accepted = response.status_code in {200, 202} and response.ok
+        if is_update:
+            response = self.request_api(
+                "PATCH",
+                endpoint=f"contacts/{contact_id}",
+                request_data=envelope,
+            )
+            accepted = response.status_code == 200 and response.ok
+            cached_contact = self.extract_contact_from_response(response.json())
+            if cached_contact is None:
+                cached_contact = self._fetch_contact_by_id(str(contact_id))
+        else:
+            response = self.request_api(
+                "POST",
+                endpoint="contacts",
+                request_data=envelope,
+            )
+            accepted = response.status_code == 200 and response.ok
+            cached_contact = self.extract_contact_from_response(response.json())
+            if cached_contact and cached_contact.get("id") is not None:
+                contact_id = cached_contact["id"]
 
-        cached_contact = None
-        if contact_id is not None:
-            cached_contact = self._fetch_contact_by_id(str(contact_id))
         self._store_contact_in_cache(contact_for_cache(record, cached_contact))
 
         state_dict["success"] = accepted
-        if contact_id is not None:
+        if is_update:
             state_dict["is_updated"] = True
         return contact_id, accepted, state_dict

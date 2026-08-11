@@ -1,4 +1,4 @@
-"""Contact cache and client-side lookup for Qomon upserts."""
+"""Contact cache and client-side lookup for Qomon contact writes."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def contact_for_cache(
 
 
 class ContactLookupMixin:
-    """Load contacts once per job and resolve upsert matches from the in-memory cache."""
+    """Load contacts once per job and resolve create vs update matches from the in-memory cache."""
 
     @property
     def lookup_method(self) -> str:

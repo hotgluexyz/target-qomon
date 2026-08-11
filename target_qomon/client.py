@@ -13,8 +13,10 @@ from hotglue_singer_sdk.target_sdk.client import HotglueSink
 
 from target_qomon.contact_lookup import ContactLookupMixin
 from target_qomon.custom_fields import (
+    custom_field_definitions_by_id,
     custom_field_definitions_by_label,
     custom_field_values_by_label,
+    custom_fields_for_sync_write,
 )
 
 
@@ -24,6 +26,7 @@ class _QomonCache:
     contacts_by_email: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     contacts_loaded: bool = False
     custom_fields_by_label: dict[str, dict[str, Any]] = field(default_factory=dict)
+    custom_fields_by_id: dict[int, dict[str, Any]] = field(default_factory=dict)
     custom_fields_loaded: bool = False
 
 
@@ -49,7 +52,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
 
     @property
     def endpoint(self) -> str:
-        return "contacts/upsert"
+        return "contacts"
 
     @property
     def default_headers(self) -> dict[str, str]:
@@ -125,6 +128,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
         self.logger.info("Loading custom field definitions into cache")
         definitions = self._load_forms_by_type("custom_fields")
         self._cache.custom_fields_by_label = custom_field_definitions_by_label(definitions)
+        self._cache.custom_fields_by_id = custom_field_definitions_by_id(definitions)
         self._cache.custom_fields_loaded = True
 
     def clean_null_values(self, data: Any) -> Any:
@@ -209,7 +213,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
     ) -> dict[str, Any]:
         """Keep existing non-empty values and fill only empty fields from incoming data."""
         self.ensure_custom_fields_loaded()
-        existing_custom = custom_field_values_by_label(existing)
+        existing_custom = custom_field_values_by_label(existing, self._cache.custom_fields_by_id)
         merged = dict(incoming)
         for key, incoming_value in incoming.items():
             if key == "address" and isinstance(incoming_value, dict):
@@ -239,9 +243,97 @@ class QomonSink(ContactLookupMixin, HotglueSink):
                 merged[key] = existing_value
         return merged
 
-    def build_upsert_envelope(self, contact_data: dict[str, Any]) -> dict[str, Any]:
-        """Wrap contact data in the Qomon upsert envelope."""
-        return {
-            "kind": "contact",
-            "data": contact_data,
+    _READ_ONLY_CONTACT_KEYS = frozenset(
+        {
+            "CreatedAt",
+            "UpdatedAt",
+            "lastchange",
+            "lastchangeuserid",
+            "group_id",
+        },
+    )
+
+    def _merge_for_sync_update(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Overlay incoming fields onto an existing contact for PATCH /contacts/{id}."""
+        merged = dict(existing)
+        for key, value in incoming.items():
+            if key == "address" and isinstance(value, dict):
+                existing_address = existing.get("address") or {}
+                if not isinstance(existing_address, dict):
+                    existing_address = {}
+                merged["address"] = {**existing_address, **value}
+                continue
+            merged[key] = value
+        return merged
+
+    def _strip_read_only_contact_fields(self, contact: dict[str, Any]) -> dict[str, Any]:
+        """Remove read-only keys before writing a contact."""
+        stripped = {
+            key: value
+            for key, value in contact.items()
+            if key not in self._READ_ONLY_CONTACT_KEYS
         }
+        address = stripped.get("address")
+        if isinstance(address, dict):
+            stripped["address"] = {
+                key: value
+                for key, value in address.items()
+                if key
+                not in {
+                    "id",
+                    "latitude",
+                    "longitude",
+                    "location",
+                    "score",
+                }
+            }
+        return stripped
+
+    def prepare_sync_contact(
+        self,
+        contact_data: dict[str, Any],
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Merge with an existing contact and adapt payloads for POST/PATCH /contacts."""
+        payload = (
+            self._merge_for_sync_update(existing, contact_data)
+            if existing
+            else dict(contact_data)
+        )
+        custom_fields = payload.get("custom_fields")
+        if isinstance(custom_fields, list) and custom_fields:
+            self.ensure_custom_fields_loaded()
+            converted = custom_fields_for_sync_write(
+                custom_fields,
+                self._cache.custom_fields_by_label,
+                existing,
+                self._cache.custom_fields_by_id,
+            )
+            if not converted:
+                raise InvalidPayloadError(
+                    "Custom fields could not be mapped for sync contact write.",
+                )
+            payload["custom_fields"] = converted
+        return self._strip_read_only_contact_fields(payload)
+
+    def build_contact_envelope(self, contact_data: dict[str, Any]) -> dict[str, Any]:
+        """Wrap contact data in the Qomon synchronous write envelope."""
+        return {
+            "data": {
+                "contact": contact_data,
+            },
+        }
+
+    def extract_contact_from_response(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return the contact object from a Qomon write response."""
+        contact = self._unwrap_data(payload, "data", "contact")
+        if isinstance(contact, dict):
+            return contact
+        return None

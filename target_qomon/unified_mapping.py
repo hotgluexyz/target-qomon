@@ -134,7 +134,7 @@ def build_address(record: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def build_contact_payload(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """Map a unified contact record to a Qomon upsert payload."""
+    """Map a unified contact record to a Qomon contact write payload."""
     phone, mobile = extract_phones(record)
     payload: dict[str, Any] = {
         "firstname": record.get("first_name"),
