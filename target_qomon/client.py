@@ -83,18 +83,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
                             "per_page": self.page_size,
                             "page": page,
                             "query": {
-                                "$all": [
-                                    {
-                                        "$all": [
-                                            {
-                                                "$condition": {
-                                                    "attr": "mail",
-                                                    "ope": "ext",
-                                                },
-                                            },
-                                        ],
-                                    },
-                                ],
+                                "$all": [],
                             },
                         },
                     },
@@ -157,6 +146,62 @@ class QomonSink(ContactLookupMixin, HotglueSink):
                 cleaned[key] = value
         return cleaned
 
+    @staticmethod
+    def _merge_custom_fields(
+        existing: dict[str, Any],
+        incoming: list[Any],
+        existing_custom: dict[str, Any],
+    ) -> list[dict[str, str]]:
+        """Merge custom field entries by label for only_upsert_empty_fields."""
+        merged_custom: list[dict[str, str]] = []
+        incoming_labels: set[str] = set()
+        for entry in incoming:
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("label") or entry.get("name")
+            if label is None:
+                continue
+            label_str = str(label)
+            incoming_labels.add(label_str)
+            existing_value = existing_custom.get(label_str)
+            if existing_value not in (None, ""):
+                merged_custom.append({"label": label_str, "value": str(existing_value)})
+                continue
+            value = entry.get("value")
+            if value is not None:
+                merged_custom.append({"label": label_str, "value": str(value)})
+
+        for entry in existing.get("custom_fields") or []:
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("label") or entry.get("name")
+            if label is None:
+                continue
+            label_str = str(label)
+            if label_str in incoming_labels:
+                continue
+            value = entry.get("value")
+            if value in (None, ""):
+                continue
+            merged_custom.append({"label": label_str, "value": str(value)})
+            incoming_labels.add(label_str)
+
+        for formdata in existing.get("formdatas") or []:
+            if not isinstance(formdata, dict):
+                continue
+            label = formdata.get("label") or formdata.get("data")
+            if label is None:
+                continue
+            label_str = str(label)
+            if label_str in incoming_labels:
+                continue
+            value = formdata.get("data") or formdata.get("value")
+            if value in (None, ""):
+                continue
+            merged_custom.append({"label": label_str, "value": str(value)})
+
+        return merged_custom
+
     def merge_empty_fields(
         self,
         existing: dict[str, Any],
@@ -172,11 +217,19 @@ class QomonSink(ContactLookupMixin, HotglueSink):
                 if not isinstance(existing_address, dict):
                     existing_address = {}
                 merged_address = dict(incoming_value)
-                for address_key, address_value in incoming_value.items():
+                for address_key in incoming_value:
                     existing_value = existing_address.get(address_key)
                     if existing_value not in (None, ""):
                         merged_address[address_key] = existing_value
                 merged["address"] = merged_address
+                continue
+
+            if key == "custom_fields" and isinstance(incoming_value, list):
+                merged["custom_fields"] = self._merge_custom_fields(
+                    existing,
+                    incoming_value,
+                    existing_custom,
+                )
                 continue
 
             existing_value = existing.get(key)
