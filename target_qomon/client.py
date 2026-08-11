@@ -199,7 +199,9 @@ class QomonSink(ContactLookupMixin, HotglueSink):
             label_str = str(label)
             if label_str in incoming_labels:
                 continue
-            value = formdata.get("data") or formdata.get("value")
+            value = formdata.get("data")
+            if value is None:
+                value = formdata.get("value")
             if value in (None, ""):
                 continue
             merged_custom.append({"label": label_str, "value": str(value)})
@@ -245,6 +247,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
 
     _READ_ONLY_CONTACT_KEYS = frozenset(
         {
+            "id",
             "CreatedAt",
             "UpdatedAt",
             "lastchange",
@@ -271,7 +274,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
         return merged
 
     def _strip_read_only_contact_fields(self, contact: dict[str, Any]) -> dict[str, Any]:
-        """Remove read-only keys before writing a contact."""
+        """Remove read-only top-level contact keys before writing a contact."""
         stripped = {
             key: value
             for key, value in contact.items()

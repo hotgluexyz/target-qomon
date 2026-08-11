@@ -120,7 +120,9 @@ def custom_field_values_by_label(
             label = formdata.get("label") or formdata.get("data")
         if label is None:
             continue
-        value = formdata.get("data") or formdata.get("value")
+        value = formdata.get("data")
+        if value is None:
+            value = formdata.get("value")
         if value is not None:
             by_label[str(label)] = value
     return by_label
@@ -144,7 +146,9 @@ def custom_fields_for_sync_write(
             continue
         if entry.get("form_id") is not None and entry.get("form_ref_id") is not None:
             label = _label_for_entry(entry, definitions_by_id or {})
-            data = entry.get("data") or entry.get("value")
+            data = entry.get("data")
+            if data is None:
+                data = entry.get("value")
             if label is not None and data is not None:
                 values_by_label[label] = data
             continue
