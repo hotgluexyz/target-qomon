@@ -1,4 +1,4 @@
-"""Contact cache and client-side lookup for Qomon contact writes."""
+"""Contact search lookup for Qomon contact writes."""
 
 from __future__ import annotations
 
@@ -7,107 +7,30 @@ from typing import Any
 from hotglue_singer_sdk.exceptions import FatalAPIError
 
 from target_qomon.unified_mapping import (
+    SUPPORTED_LOOKUP_FIELDS,
     contact_lookup_value,
+    search_attr_for_lookup_field,
     unified_lookup_value,
     values_match,
 )
 
 DEFAULT_LOOKUP_FIELDS = ["id", "email"]
+SEARCH_RESULT_LIMIT = 50
 
 
-def _merge_cached_contact(
-    previous: dict[str, Any],
-    incoming: dict[str, Any],
-) -> dict[str, Any]:
-    """Overlay a partial API response onto a cached contact without dropping omitted fields."""
-    merged = dict(previous)
-    for key, value in incoming.items():
-        if value is not None:
-            merged[key] = value
-    return merged
-
-
-def contact_for_cache(
-    written: dict[str, Any],
-    response: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Build a cache entry from the written payload overlaid by the API response."""
-    if not response:
-        return dict(written)
-    contact_id = response.get("id")
-    if contact_id is None:
-        return response
-    merged = dict(written)
-    merged["id"] = contact_id
-    return _merge_cached_contact(merged, response)
+def _search_operator_for_field(unified_field: str) -> str:
+    if unified_field == "email":
+        return "eql:strictdata"
+    return "eql"
 
 
 class ContactLookupMixin:
-    """Load contacts once per job and resolve create vs update matches from the in-memory cache."""
+    """Resolve create vs update matches via GET or the Qomon Search API."""
 
     @property
     def lookup_method(self) -> str:
         method = (self.config.get("lookup_method") or "sequential").lower()
         return method if method in {"sequential", "all"} else "sequential"
-
-    def ensure_contacts_loaded(self) -> None:
-        """Load contacts once per job into shared id and email indexes."""
-        if self._cache.contacts_loaded:
-            return
-        self.logger.info("Loading all contacts into cache")
-        for contact in self._paginate_contacts():
-            self._store_contact_in_cache(contact)
-        self._log_duplicate_emails()
-        self._cache.contacts_loaded = True
-        self.logger.info("Loaded %s contacts into cache", len(self._cache.contacts_by_id))
-
-    def _store_contact_in_cache(self, contact: dict[str, Any]) -> None:
-        """Update the in-memory contact indexes from a contact payload."""
-        contact_id = contact.get("id")
-        if contact_id is None:
-            return
-        contact_id_str = str(contact_id)
-        previous = self._cache.contacts_by_id.get(contact_id_str)
-        if previous:
-            contact = _merge_cached_contact(previous, contact)
-        self._cache.contacts_by_id[contact_id_str] = contact
-
-        email = contact.get("mail")
-        if previous and previous.get("mail"):
-            old_key = str(previous["mail"]).strip().lower()
-            new_key = str(email).strip().lower() if email else None
-            if old_key != new_key:
-                remaining = [
-                    existing
-                    for existing in self._cache.contacts_by_email.get(old_key, [])
-                    if str(existing.get("id")) != contact_id_str
-                ]
-                if remaining:
-                    self._cache.contacts_by_email[old_key] = remaining
-                else:
-                    self._cache.contacts_by_email.pop(old_key, None)
-
-        if not email:
-            return
-        key = str(email).strip().lower()
-        bucket = self._cache.contacts_by_email.setdefault(key, [])
-        for index, existing in enumerate(bucket):
-            if str(existing.get("id")) == contact_id_str:
-                bucket[index] = contact
-                return
-        bucket.append(contact)
-
-    def _log_duplicate_emails(self) -> None:
-        """Warn once per job about emails attached to multiple Qomon contacts."""
-        for email, contacts in self._cache.contacts_by_email.items():
-            if len(contacts) <= 1:
-                continue
-            ids = [contact.get("id") for contact in contacts]
-            self.logger.warning(
-                "Duplicate email '%s' found on Qomon contacts with ids: %s",
-                email,
-                ids,
-            )
 
     def get_lookup_fields(self) -> list[str]:
         """Return configured lookup fields for this stream, defaulting to id then email."""
@@ -116,26 +39,15 @@ class ContactLookupMixin:
         if fields is None:
             fields = DEFAULT_LOOKUP_FIELDS
         if isinstance(fields, str):
-            return [fields]
-        return list(fields)
-
-    def _pick_best_duplicate(
-        self,
-        contacts: list[dict[str, Any]],
-        record: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Choose one contact when multiple records share a lookup value."""
-        record_id = record.get("id")
-        if record_id is not None:
-            for contact in contacts:
-                if str(contact.get("id")) == str(record_id):
-                    return contact
-        sorted_contacts = sorted(
-            contacts,
-            key=lambda contact: contact.get("lastchange") or contact.get("UpdatedAt") or "",
-            reverse=True,
-        )
-        return sorted_contacts[0]
+            fields = [fields]
+        supported = [field for field in fields if field in SUPPORTED_LOOKUP_FIELDS]
+        unsupported = [field for field in fields if field not in SUPPORTED_LOOKUP_FIELDS]
+        if unsupported:
+            self.logger.warning(
+                "Ignoring unsupported lookup fields: %s. Supported: id, email, first_name, last_name, external_id",
+                unsupported,
+            )
+        return supported
 
     def _record_field_value(self, record: dict[str, Any], field: str) -> Any:
         return unified_lookup_value(record, field)
@@ -146,128 +58,150 @@ class ContactLookupMixin:
         field: str,
         expected: Any,
     ) -> bool:
-        """Return whether a cached contact matches a unified lookup field value."""
+        """Return whether a Qomon contact matches a unified lookup field value."""
         actual = contact_lookup_value(contact, field)
         return values_match(field, expected, actual)
 
-    def _lookup_by_field(
+    def _build_search_condition(
+        self,
+        field: str,
+        value: Any,
+    ) -> dict[str, Any] | None:
+        """Build a single Qomon search $condition for a lookup field."""
+        if field == "id":
+            return None
+        attr = search_attr_for_lookup_field(field)
+        if not attr:
+            return None
+        return {
+            "$condition": {
+                "attr": attr,
+                "ope": _search_operator_for_field(field),
+                "value": str(value),
+            },
+        }
+
+    def _lookup_fields_with_values(
         self,
         record: dict[str, Any],
-        field: str,
-    ) -> dict[str, Any] | None:
-        """Find a cached contact using a single lookup field."""
-        value = self._record_field_value(record, field)
-        if value in (None, ""):
-            return None
+        fields: list[str],
+    ) -> list[tuple[str, Any]]:
+        populated: list[tuple[str, Any]] = []
+        for field in fields:
+            value = self._record_field_value(record, field)
+            if value in (None, ""):
+                continue
+            populated.append((field, value))
+        return populated
 
-        if field == "id":
-            cached = self._cache.contacts_by_id.get(str(value))
-            if cached:
-                return cached
-            return self._fetch_contact_by_id(str(value))
+    def _search_contacts(self, inner_group: dict[str, Any]) -> list[dict[str, Any]]:
+        """Run a single-page Qomon contact search and return matching contacts."""
+        response = self.request_api(
+            "POST",
+            endpoint="search",
+            request_data={
+                "data": {
+                    "advanced_search": {
+                        "per_page": SEARCH_RESULT_LIMIT,
+                        "page": 0,
+                        "query": {
+                            "$all": [inner_group],
+                        },
+                    },
+                },
+            },
+        )
+        payload = response.json()
+        contacts = payload.get("data", {}).get("contacts") or []
+        if not isinstance(contacts, list):
+            return []
+        return [contact for contact in contacts if isinstance(contact, dict)]
 
-        if field in {"email", "mail"}:
-            matches = self._cache.contacts_by_email.get(str(value).strip().lower(), [])
-            if not matches:
-                return None
-            chosen = self._pick_best_duplicate(matches, record)
-            if len(matches) > 1:
-                self._warn_duplicate_lookup(str(value), matches, chosen)
-            return chosen
-
-        matches: list[dict[str, Any]] = []
-        for contact in self._cache.contacts_by_id.values():
-            if self._contact_matches_value(contact, field, value):
-                matches.append(contact)
-        if not matches:
-            return None
-        chosen = self._pick_best_duplicate(matches, record)
-        if len(matches) > 1:
-            self.logger.warning(
-                "Lookup matched multiple contacts for field '%s'; using contact id %s. Other ids: %s",
-                field,
-                chosen.get("id"),
-                [contact.get("id") for contact in matches],
-            )
-        return chosen
-
-    def _lookup_by_all_fields(
+    def _lookup_by_id(
         self,
         record: dict[str, Any],
         fields: list[str],
     ) -> dict[str, Any] | None:
-        """Find a cached contact that matches every configured lookup field."""
-        for field in fields:
-            if self._record_field_value(record, field) in (None, ""):
-                return None
+        if "id" not in fields:
+            return None
+        contact_id = self._record_field_value(record, "id")
+        if contact_id in (None, ""):
+            return None
+        return self._fetch_contact_by_id(str(contact_id))
 
-        candidates = list(self._cache.contacts_by_id.values())
-        for field in fields:
-            expected = self._record_field_value(record, field)
-            candidates = [
-                contact
-                for contact in candidates
-                if self._contact_matches_value(contact, field, expected)
-            ]
-            if not candidates:
-                return None
-
-        if len(candidates) > 1:
-            email = record.get("email")
-            chosen = self._pick_best_duplicate(candidates, record)
-            if email:
-                self._warn_duplicate_lookup(str(email), candidates, chosen)
-            else:
-                self.logger.warning(
-                    "Lookup matched multiple contacts for fields %s; using contact id %s. Other ids: %s",
-                    fields,
-                    chosen.get("id"),
-                    [contact.get("id") for contact in candidates],
-                )
-            return chosen
-        return self._pick_best_duplicate(candidates, record)
-
-    def _warn_duplicate_lookup(
+    def _lookup_by_search_or(
         self,
-        email: str,
-        contacts: list[dict[str, Any]],
-        chosen: dict[str, Any],
-    ) -> None:
-        """Warn when a lookup hits multiple contacts for the same email."""
-        key = email.strip().lower()
-        if key in self._duplicate_emails_logged:
-            return
-        ids = [contact.get("id") for contact in contacts]
-        self.logger.warning(
-            "Lookup matched duplicate email '%s'; using contact id %s. Other ids: %s",
-            email,
-            chosen.get("id"),
-            ids,
-        )
-        self._duplicate_emails_logged.add(key)
+        record: dict[str, Any],
+        fields: list[str],
+    ) -> dict[str, Any] | None:
+        """Find a contact matching any populated lookup field (excluding id)."""
+        conditions: list[dict[str, Any]] = []
+        for field, value in self._lookup_fields_with_values(record, fields):
+            if field == "id":
+                continue
+            condition = self._build_search_condition(field, value)
+            if condition:
+                conditions.append(condition)
+        if not conditions:
+            return None
+
+        matches = self._search_contacts({"$at_least_one": conditions})
+        if not matches:
+            return None
+        return matches[0]
+
+    def _lookup_by_search_all(
+        self,
+        record: dict[str, Any],
+        fields: list[str],
+    ) -> dict[str, Any] | None:
+        """Find a contact matching every configured lookup field."""
+        populated = self._lookup_fields_with_values(record, fields)
+        if len(populated) != len(fields):
+            return None
+
+        id_fields = [(field, value) for field, value in populated if field == "id"]
+        if id_fields:
+            contact = self._fetch_contact_by_id(str(id_fields[0][1]))
+            if contact is None:
+                return None
+            for field, expected in populated:
+                if not self._contact_matches_value(contact, field, expected):
+                    return None
+            return contact
+
+        conditions: list[dict[str, Any]] = []
+        for field, value in populated:
+            condition = self._build_search_condition(field, value)
+            if condition:
+                conditions.append(condition)
+        if not conditions:
+            return None
+
+        matches = self._search_contacts({"$all": conditions})
+        if not matches:
+            return None
+        return matches[0]
 
     def find_matching_contact(self, record: dict[str, Any]) -> dict[str, Any] | None:
-        """Resolve an existing contact from the cache using configured lookup fields."""
-        self.ensure_contacts_loaded()
+        """Resolve an existing contact using GET (for id) or the Search API."""
         fields = self.get_lookup_fields()
         if not fields:
             return None
-        if self.lookup_method == "all":
-            return self._lookup_by_all_fields(record, fields)
 
-        for field in fields:
-            match = self._lookup_by_field(record, field)
-            if match:
-                self.logger.info(
-                    "Found existing contact id %s via lookup field '%s'",
-                    match.get("id"),
-                    field,
-                )
-                return match
-        return None
+        if self.lookup_method == "all":
+            match = self._lookup_by_search_all(record, fields)
+        else:
+            match = self._lookup_by_id(record, fields)
+            if match is None:
+                match = self._lookup_by_search_or(record, fields)
+
+        if match:
+            self.logger.info("Found existing contact id %s", match.get("id"))
+        return match
 
     def _fetch_contact_by_id(self, contact_id: str) -> dict[str, Any] | None:
-        """Fetch a contact by id when it is missing from the cache."""
+        """Fetch a contact by id."""
         try:
             response = self.request_api("GET", endpoint=f"contacts/{contact_id}")
         except FatalAPIError:
@@ -275,6 +209,5 @@ class ContactLookupMixin:
         payload = response.json()
         contact = payload.get("data", {}).get("contact") or payload.get("contact") or payload
         if isinstance(contact, dict):
-            self._store_contact_in_cache(contact)
             return contact
         return None

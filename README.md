@@ -40,19 +40,29 @@ Example `config.json`:
 
 ### Lookup fields
 
-Qomon has no server-side match API for all lookup scenarios, so upserts resolve existing contacts from a contact cache loaded once per job. Configure `lookup_fields` and `lookup_method` (`sequential` or `all`) to control how records are matched before create vs update.
+Before each write, existing contacts are resolved with `GET /contacts/{id}` (when `id` is configured) or `POST /search`. Configure `lookup_fields` and `lookup_method` to control matching:
 
-Supported examples:
+- `sequential` (default) — try `id` via GET, then search with OR across other populated lookup fields
+- `all` — every lookup field must be populated and match the same contact (AND search, or GET by `id` plus field verification)
+
+Supported lookup fields:
 
 | Unified field | Qomon field |
 | --- | --- |
 | `id` | `id` |
 | `email` | `mail` |
-| `external_id`, `externalId` | `external_id` |
+| `external_id` | `external_id` |
 | `first_name` | `firstname` |
 | `last_name` | `surname` |
-| `mobile`, `phone` | `mobile`, `phone` |
-| `city`, `postal_code`, `country`, `address` | address sub-fields |
+
+### Contact writes
+
+Records are written with synchronous Qomon endpoints:
+
+- **Create** — `POST /contacts` when no match is found; the new contact ID is returned in job state
+- **Update** — `PATCH /contacts/{id}` when a match is found
+
+Custom fields are mapped using form definitions from `GET /v1/forms/type/custom_fields` (cached once per job) into the sync API shape (`form_id`, `form_ref_id`, `data`).
 
 ## Source Authentication and Authorization
 
@@ -64,7 +74,7 @@ See the [Qomon developer docs](https://developers.qomon.com/pages/v1/getting-sta
 
 | Stream | Description |
 | --- | --- |
-| `Contacts` | Unified contacts sink with tags, custom fields, and upsert support |
+| `Contacts` | Unified contacts sink with tags, custom fields, and synchronous create/update |
 
 ## Usage
 

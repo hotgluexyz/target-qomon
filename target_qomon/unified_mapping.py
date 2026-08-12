@@ -4,15 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-# Unified field name -> Qomon contact payload key.
-UNIFIED_TO_QOMON: dict[str, str] = {
-    "first_name": "firstname",
-    "last_name": "surname",
-    "email": "mail",
-    "externalId": "external_id",
-    "external_id": "external_id",
-}
-
 # Standard Qomon contact payload keys (not custom field definitions).
 QOMON_NATIVE_CONTACT_FIELDS = frozenset(
     {
@@ -59,32 +50,14 @@ ADDRESS_FIELD_TO_QOMON: dict[str, str] = {
 LOOKUP_FIELD_TO_SEARCH_ATTR: dict[str, str] = {
     "id": "id",
     "email": "mail",
-    "mail": "mail",
-    "external_id": "external_id",
-    "externalId": "external_id",
     "first_name": "firstname",
-    "firstname": "firstname",
     "last_name": "surname",
-    "surname": "surname",
-    "mobile": "mobile",
-    "phone": "phone",
-    "city": "address.city",
-    "postal_code": "address.postalcode",
-    "postalcode": "address.postalcode",
-    "country": "address.country",
-    "street": "address.street",
-    "address": "address.street",
-    "line1": "address.street",
+    "external_id": "external_id",
 }
 
+SUPPORTED_LOOKUP_FIELDS = frozenset(LOOKUP_FIELD_TO_SEARCH_ATTR)
+
 NON_DIALABLE_PHONE_TYPES = {"fax", "pager"}
-
-
-def qomon_field_name(unified_field: str) -> str:
-    """Return the Qomon contact key used for a unified field."""
-    if unified_field in ADDRESS_FIELD_TO_QOMON:
-        return ADDRESS_FIELD_TO_QOMON[unified_field]
-    return UNIFIED_TO_QOMON.get(unified_field, unified_field)
 
 
 def extract_phones(record: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -173,45 +146,25 @@ def unified_lookup_value(record: dict[str, Any], unified_field: str) -> Any:
     """Read a lookup value from a unified contact record."""
     if unified_field == "id":
         return record.get("id")
-    if unified_field in {"email", "mail"} and record.get("email"):
+    if unified_field == "email" and record.get("email"):
         return str(record["email"]).strip().lower()
-    if unified_field in {"external_id", "externalId"}:
+    if unified_field == "external_id":
         return record.get("external_id") or record.get("externalId")
-    if unified_field == "phone":
-        return extract_phones(record)[0]
-    if unified_field == "mobile":
-        return extract_phones(record)[1]
-
-    address = _first_address(record)
-    for address_key, qomon_key in ADDRESS_FIELD_TO_QOMON.items():
-        if unified_field == qomon_key or unified_field == address_key:
-            return address.get(address_key) or record.get(unified_field)
-
-    qomon_key = qomon_field_name(unified_field)
-    return record.get(unified_field) or record.get(qomon_key)
+    if unified_field == "first_name":
+        return record.get("first_name")
+    if unified_field == "last_name":
+        return record.get("last_name")
+    return None
 
 
 def contact_lookup_value(contact: dict[str, Any], unified_field: str) -> Any:
-    """Read a comparable lookup value from a cached Qomon contact."""
-    if unified_field == "id":
-        return contact.get("id")
-    if unified_field in {"email", "mail"} and contact.get("mail"):
+    """Read a comparable lookup value from a Qomon contact."""
+    qomon_field = LOOKUP_FIELD_TO_SEARCH_ATTR.get(unified_field)
+    if qomon_field is None:
+        return None
+    if unified_field == "email" and contact.get("mail"):
         return str(contact["mail"]).strip().lower()
-    if unified_field in {"external_id", "externalId"}:
-        return contact.get("external_id")
-    if unified_field in {"phone", "mobile"}:
-        return contact.get(unified_field)
-
-    qomon_key = qomon_field_name(unified_field)
-    if qomon_key == "street":
-        address = contact.get("address") or {}
-        if isinstance(address, dict):
-            return address.get("street") or contact.get("street")
-    if qomon_key in {"city", "postalcode", "country", "state"}:
-        address = contact.get("address") or {}
-        if isinstance(address, dict):
-            return address.get(qomon_key)
-    return contact.get(qomon_key)
+    return contact.get(qomon_field)
 
 
 def values_match(unified_field: str, expected: Any, actual: Any) -> bool:
@@ -220,13 +173,11 @@ def values_match(unified_field: str, expected: Any, actual: Any) -> bool:
         return False
     if expected in (None, ""):
         return False
-    if unified_field in {"email", "mail"}:
+    if unified_field == "email":
         return str(actual).strip().lower() == str(expected).strip().lower()
     return str(actual) == str(expected)
 
 
 def search_attr_for_lookup_field(unified_field: str) -> str | None:
     """Return the Qomon search attribute for a unified lookup field."""
-    return LOOKUP_FIELD_TO_SEARCH_ATTR.get(unified_field) or LOOKUP_FIELD_TO_SEARCH_ATTR.get(
-        qomon_field_name(unified_field),
-    )
+    return LOOKUP_FIELD_TO_SEARCH_ATTR.get(unified_field)

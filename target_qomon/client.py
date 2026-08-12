@@ -1,4 +1,4 @@
-"""Qomon target base sink with HTTP, entity caches, and payload helpers."""
+"""Qomon target base sink with HTTP, custom-field cache, and payload helpers."""
 
 from __future__ import annotations
 
@@ -22,9 +22,6 @@ from target_qomon.custom_fields import (
 
 @dataclass
 class _QomonCache:
-    contacts_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
-    contacts_by_email: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    contacts_loaded: bool = False
     custom_fields_by_label: dict[str, dict[str, Any]] = field(default_factory=dict)
     custom_fields_by_id: dict[int, dict[str, Any]] = field(default_factory=dict)
     custom_fields_loaded: bool = False
@@ -32,8 +29,6 @@ class _QomonCache:
 
 class QomonSink(ContactLookupMixin, HotglueSink):
     """Base sink for Qomon API interactions."""
-
-    page_size = 1000
 
     def __init__(
         self,
@@ -44,7 +39,6 @@ class QomonSink(ContactLookupMixin, HotglueSink):
     ) -> None:
         super().__init__(target, stream_name, schema, key_properties)
         self._cache = _QomonCache()
-        self._duplicate_emails_logged: set[str] = set()
 
     @property
     def base_url(self) -> str:
@@ -71,36 +65,6 @@ class QomonSink(ContactLookupMixin, HotglueSink):
         if 400 <= response.status_code < 500:
             raise FatalAPIError(response.text or response.reason)
         super().validate_response(response)
-
-    def _paginate_contacts(self) -> list[dict[str, Any]]:
-        """Fetch contacts from the Qomon search API."""
-        results: list[dict[str, Any]] = []
-        page = 0
-        while True:
-            response = self.request_api(
-                "POST",
-                endpoint="search",
-                request_data={
-                    "data": {
-                        "advanced_search": {
-                            "per_page": self.page_size,
-                            "page": page,
-                            "query": {
-                                "$all": [],
-                            },
-                        },
-                    },
-                },
-            )
-            payload = response.json()
-            contacts = payload.get("data", {}).get("contacts") or []
-            if not isinstance(contacts, list):
-                break
-            results.extend(contacts)
-            if len(contacts) < self.page_size:
-                break
-            page += 1
-        return results
 
     @staticmethod
     def _unwrap_data(payload: dict[str, Any], *keys: str) -> Any:

@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from target_qomon.client import QomonSink
-from target_qomon.contact_lookup import contact_for_cache
 from target_qomon.unified_mapping import build_contact_payload
 
 
@@ -77,9 +76,6 @@ class ContactsSink(QomonSink):
                 request_data=envelope,
             )
             accepted = response.status_code == 200 and response.ok
-            cached_contact = self.extract_contact_from_response(response.json())
-            if cached_contact is None:
-                cached_contact = self._fetch_contact_by_id(str(contact_id))
         else:
             response = self.request_api(
                 "POST",
@@ -87,11 +83,9 @@ class ContactsSink(QomonSink):
                 request_data=envelope,
             )
             accepted = response.status_code == 200 and response.ok
-            cached_contact = self.extract_contact_from_response(response.json())
-            if cached_contact and cached_contact.get("id") is not None:
-                contact_id = cached_contact["id"]
-
-        self._store_contact_in_cache(contact_for_cache(record, cached_contact))
+            created_contact = self.extract_contact_from_response(response.json())
+            if created_contact and created_contact.get("id") is not None:
+                contact_id = created_contact["id"]
 
         state_dict["success"] = accepted
         if is_update:
