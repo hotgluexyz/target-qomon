@@ -1,0 +1,26 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Run target-qomon",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/target_qomon/target.py",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        },
+        "cwd": "${workspaceFolder}/.secrets",
+        "args": [
+          "--config",
+          "config.json",
+          "--input",
+          "etl-output/data.singer",
+          ">",
+          "target-state.json"
+        ],
+        "console": "integratedTerminal",
+        "python": "${workspaceFolder}/.venv/bin/python",
+        "justMyCode": false
+      }
+    ]
+  }
