@@ -42,7 +42,7 @@ class QomonSink(ContactLookupMixin, HotglueSink):
 
     @property
     def base_url(self) -> str:
-        return self.config["api_base_url"].rstrip("/") + "/"
+        return self.config.get("api_base_url", "https://incoming.qomon.app").rstrip("/") + "/"
 
     @property
     def endpoint(self) -> str:
