@@ -28,8 +28,7 @@ class TargetQomon(TargetHotglue):
         th.Property(
             "api_base_url",
             th.StringType,
-            required=True,
-            description="Qomon API base URL, e.g. https://incoming.qomon.app",
+            description="Qomon API base URL, e.g. If not provided, the default will be used. https://incoming.qomon.app",
         ),
         th.Property(
             "only_upsert_empty_fields",
