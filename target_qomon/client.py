@@ -25,6 +25,8 @@ class _QomonCache:
     custom_fields_by_label: dict[str, dict[str, Any]] = field(default_factory=dict)
     custom_fields_by_id: dict[int, dict[str, Any]] = field(default_factory=dict)
     custom_fields_loaded: bool = False
+    consent_forms: list[dict[str, Any]] = field(default_factory=list)
+    consent_forms_loaded: bool = False
 
 
 class QomonSink(ContactLookupMixin, HotglueSink):
@@ -94,6 +96,14 @@ class QomonSink(ContactLookupMixin, HotglueSink):
         self._cache.custom_fields_by_label = custom_field_definitions_by_label(definitions)
         self._cache.custom_fields_by_id = custom_field_definitions_by_id(definitions)
         self._cache.custom_fields_loaded = True
+
+    def ensure_consent_forms_loaded(self) -> None:
+        """Lazy-load consent form definitions when an opt-out is first needed."""
+        if self._cache.consent_forms_loaded:
+            return
+        self.logger.info("Loading consent form definitions into cache")
+        self._cache.consent_forms = self._load_forms_by_type("consent")
+        self._cache.consent_forms_loaded = True
 
     def clean_null_values(self, data: Any) -> Any:
         """Remove null and blank values while preserving non-empty nested structures."""
