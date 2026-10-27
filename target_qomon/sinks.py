@@ -7,6 +7,10 @@ from typing import Any
 from target_qomon.client import QomonSink
 from target_qomon.unified_mapping import build_contact_payload
 
+# Consent refvalue prefixes, e.g. consent_email / double_optin_sms / no_consent_email.
+CONSENT_OPT_IN_PREFIXES = ("consent_", "double_optin_")
+CONSENT_OPT_OUT_PREFIX = "no_consent_"
+
 
 class ContactsSink(QomonSink):
     """Unified Contacts sink for Qomon."""
@@ -22,13 +26,61 @@ class ContactsSink(QomonSink):
             return "unsubscribed"
         return "subscribed"
 
-    def _apply_subscribe_status(self, payload: dict[str, Any], record: dict[str, Any]) -> None:
-        """Map unified subscribe_status to Qomon black_list."""
+    def _consent_refs(self) -> tuple[set[tuple[Any, Any]], list[dict[str, Any]]]:
+        """Return consent opt-in refs and one no_consent_* formdata per channel."""
+        self.ensure_consent_forms_loaded()
+        opt_in_refs: set[tuple[Any, Any]] = set()
+        opt_outs: list[dict[str, Any]] = []
+        for form in self._cache.consent_forms:
+            for refvalue in form.get("refvalues") or []:
+                value = str(refvalue.get("value") or "")
+                ref = (form.get("id"), refvalue.get("id"))
+                if value.startswith(CONSENT_OPT_OUT_PREFIX):
+                    opt_outs.append({"form_id": ref[0], "form_ref_id": ref[1], "data": value})
+                elif value.startswith(CONSENT_OPT_IN_PREFIXES):
+                    opt_in_refs.add(ref)
+        return opt_in_refs, opt_outs
+
+    @staticmethod
+    def _formdatas_without(
+        existing: dict[str, Any] | None,
+        refs: set[tuple[Any, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return the existing contact's formdatas, minus the given (form_id, form_ref_id)s."""
+        return [
+            formdata
+            for formdata in (existing or {}).get("formdatas") or []
+            if isinstance(formdata, dict)
+            and (formdata.get("form_id"), formdata.get("form_ref_id")) not in refs
+        ]
+
+    def _apply_subscribe_status(
+        self,
+        payload: dict[str, Any],
+        record: dict[str, Any],
+        existing: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Map unified subscribe_status to Qomon consents, falling back to black_list.
+
+        Returns the formdatas to write after the sync merge, or None to leave them as-is.
+        """
         status = self._normalize_subscription_status(record.get("subscribe_status"))
         if status == "unsubscribed" and "black_list" not in payload:
-            payload["black_list"] = True
-        elif status == "subscribed" and record.get("subscribe_status") is not None:
+            opt_in_refs, opt_outs = self._consent_refs()
+            if not opt_outs:
+                payload["black_list"] = True
+                return None
+            # PATCH replaces formdatas, so keep other answers and drop channel opt-ins.
+            opt_out_refs = {(e["form_id"], e["form_ref_id"]) for e in opt_outs}
+            return self._formdatas_without(existing, opt_in_refs | opt_out_refs) + opt_outs
+        if status == "subscribed" and record.get("subscribe_status") is not None:
             payload["black_list"] = False
+            if existing and existing.get("formdatas"):
+                # Clear no_consent_* answers so a resubscribed contact is no longer opted out.
+                _, opt_outs = self._consent_refs()
+                opt_out_refs = {(e["form_id"], e["form_ref_id"]) for e in opt_outs}
+                return self._formdatas_without(existing, opt_out_refs)
+        return None
 
     @staticmethod
     def _build_tags(tags: list[Any]) -> list[dict[str, str]]:
@@ -48,13 +100,16 @@ class ContactsSink(QomonSink):
         if matching_contact and only_upsert_empty_fields:
             payload = self.merge_empty_fields(matching_contact, payload)
 
-        self._apply_subscribe_status(payload, record)
+        consent_formdatas = self._apply_subscribe_status(payload, record, matching_contact)
 
         if record.get("tags"):
             payload["tags"] = self._build_tags(record["tags"])
 
         payload = self.clean_null_values(payload)
         payload = self.prepare_sync_contact(payload, matching_contact)
+        # Set after the merge: an empty list would be cleaned away and the stored answers restored.
+        if consent_formdatas is not None:
+            payload["formdatas"] = consent_formdatas
 
         matching_id = matching_contact.get("id") if matching_contact else None
         if matching_id is not None:
